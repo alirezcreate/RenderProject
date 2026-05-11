@@ -1,11 +1,15 @@
 import telebot
 
 TOKEN = "8369995048:AAG30JkhKOAfx47DJJvWcWiMs1oaAZHfLaU"
-ADMIN_ID = 588350538  # آیدی عددی خودت
+ADMIN_ID = 588350538
 
 bot = telebot.TeleBot(TOKEN)
 
+# user_id -> منتظر فیش
 waiting_for_payment = {}
+
+# admin_forwarded_message_id -> user_id
+payment_map = {}
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -18,11 +22,11 @@ def start(message):
 ممنون که مارو انتخاب کردین ❤️"""
     bot.send_message(message.chat.id, text)
 
-# وقتی کاربر اطلاعات ارسال می‌کند
+# دریافت سفارش از کاربر
 @bot.message_handler(func=lambda message: message.chat.id != ADMIN_ID, content_types=['text'])
 def forward_to_admin(message):
     user = message.from_user
-    
+
     info_text = f"""
 📦 سفارش جدید
 
@@ -32,33 +36,49 @@ def forward_to_admin(message):
 
 📝 متن سفارش:
 {message.text}
-    """
+"""
 
     bot.send_message(ADMIN_ID, info_text)
     bot.send_message(message.chat.id, "✅ اطلاعات شما ارسال شد. پس از تأیید، اطلاعات پرداخت برای شما ارسال می‌شود.")
-    
-    waiting_for_payment[message.chat.id] = True
 
-# وقتی ادمین ریپلای می‌کند
-@bot.message_handler(func=lambda message: message.chat.id == ADMIN_ID, content_types=['text'])
-def reply_to_user(message):
-    if message.reply_to_message:
-        # استخراج آیدی کاربر از متن پیام
-        lines = message.reply_to_message.text.split("\n")
-        user_id_line = [line for line in lines if "آیدی عددی" in line]
-        
-        if user_id_line:
-            user_id = int(user_id_line[0].split(":")[1].strip())
-            
-            bot.send_message(user_id, message.text)
-            bot.send_message(user_id, "📸 لطفاً عکس فیش پرداخت را ارسال کنید.")
-
-# دریافت عکس فیش
+# دریافت فیش پرداخت
 @bot.message_handler(content_types=['photo'])
 def receive_payment_photo(message):
-    if message.chat.id in waiting_for_payment:
-        bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-        bot.send_message(message.chat.id, "✅ فیش دریافت شد. محصول به زودی ارسال می‌شود.")
-        waiting_for_payment.pop(message.chat.id)
+    if message.chat.id != ADMIN_ID:
+        # فقط اگر کاربر منتظر پرداخت باشد
+        if message.chat.id in waiting_for_payment:
+            sent = bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+            payment_map[sent.message_id] = message.chat.id
 
-bot.polling()
+            bot.send_message(message.chat.id, "😉❤️ فیش دریافت شد✅ پس از تایید٬ فایل براتون ارسال میشه.")
+            waiting_for_payment.pop(message.chat.id, None)
+
+# ادمین روی فیش ریپلای می‌کند و فایل محصول می‌فرستد
+@bot.message_handler(content_types=['document', 'video', 'audio', 'photo'])
+def send_product_to_user(message):
+    if message.chat.id != ADMIN_ID:
+        return
+
+    if not message.reply_to_message:
+        return
+
+    replied_id = message.reply_to_message.message_id
+
+    if replied_id not in payment_map:
+        return
+
+    user_id = payment_map[replied_id]
+
+    # اگر ادمین فایل بفرستد، همان فایل به کاربر ارسال می‌شود
+    if message.content_type == 'document':
+        bot.send_document(user_id, message.document.file_id)
+    elif message.content_type == 'video':
+        bot.send_video(user_id, message.video.file_id)
+    elif message.content_type == 'audio':
+        bot.send_audio(user_id, message.audio.file_id)
+    elif message.content_type == 'photo':
+        bot.send_photo(user_id, message.photo[-1].file_id)
+
+    bot.send_message(user_id, "Enjoy your freedom🚀🌐, support Id @jet1supp")
+
+bot.infinity_polling()
