@@ -1,301 +1,224 @@
 import telebot
+from telebot import types
+import sqlite3
+import csv
+import os
+from datetime import datetime
 
 TOKEN = "8369995048:AAG30JkhKOAfx47DJJvWcWiMs1oaAZHfLaU"
-ADMIN_ID = 588350538
+ADMIN_ID = 123456789  # آیدی عددی خودت
 
 bot = telebot.TeleBot(TOKEN)
 
-# === سفارشات ===
-waiting_for_payment = {}   # user_id -> True (منتظر فیش)
-payment_map = {}           # admin_forwarded_message_id -> user_id
+CARD_NUMBER = "6104-3389-0225-0089"
 
-# وضعیت سفارش‌ها برای پنل ادمین
-orders_pending = {}        # user_id -> order_id (یا True)
-orders_completed = set()  # user_id های که کامل شدند
+# ------------------ DATABASE ------------------
 
-# === پشتیبانی ===
-support_waiting = {}       # user_id -> True (مشتری نیازمند پشتیبانی)
-support_map = {}           # admin_forwarded_message_id -> user_id
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# === منوی ادمین ===
-ADMIN_MENU = {
-    "support": "مشتری‌های نیاز به پشتیبانی دارن",
-    "completed": "سفارشات کامل شده",
-    "pending": "سفارش های کامل نشده",
-    "back": "بازگشت"
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    volume INTEGER,
+    price INTEGER,
+    status TEXT,
+    date TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    status TEXT
+)
+""")
+
+conn.commit()
+
+# ------------------ PRICES ------------------
+
+prices = {
+    1: 260,
+    2: 500,
+    3: 730,
+    4: 950,
+    5: 1150,
+    6: 1330,
+    7: 1500,
+    8: 1660,
+    9: 1810,
+    10: 1950
 }
 
-# === منوی مشتری ===
-CLIENT_MENU = {
-    "order": "🛒ثبت سفارش",
-    "support": "🧑🏻‍🔧نیاز به پشتیبانی"
-}
+# ------------------ USER STATES ------------------
 
-def get_client_keyboard():
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    kb.add(telebot.types.KeyboardButton(CLIENT_MENU["order"]))
-    kb.add(telebot.types.KeyboardButton(CLIENT_MENU["support"]))
-    return kb
+user_states = {}
 
-def get_admin_keyboard():
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    kb.add(telebot.types.KeyboardButton(ADMIN_MENU["support"]))
-    kb.add(telebot.types.KeyboardButton(ADMIN_MENU["pending"]))
-    kb.add(telebot.types.KeyboardButton(ADMIN_MENU["completed"]))
-    return kb
+# ------------------ MENUS ------------------
 
-# -------------------------
-# START
-# -------------------------
+def main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📦 ثبت سفارش", "🆘 پشتیبانی")
+    return markup
+
+def cancel_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🔙 بازگشت")
+    return markup
+
+# ------------------ START ------------------
+
 @bot.message_handler(commands=['start'])
 def start(message):
-    if message.chat.id == ADMIN_ID:
-        bot.send_message(
-            ADMIN_ID,
-            "سلام! پنل ادمین فعال شد.",
-            reply_markup=get_admin_keyboard()
-        )
+    user_id = message.chat.id
+
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+
+    if user_id == ADMIN_ID:
+        admin_panel(message)
     else:
-        bot.send_message(
-            message.chat.id,
-            "سلام 👋 لطفاً یکی از گزینه‌ها رو انتخاب کن:",
-            reply_markup=get_client_keyboard()
-        )
+        bot.send_message(user_id, "به ربات خوش آمدید 👋", reply_markup=main_menu())
 
-# -------------------------
-# دریافت ثبت سفارش از دکمه
-# -------------------------
-@bot.message_handler(func=lambda m: m.chat.id != ADMIN_ID and m.text == CLIENT_MENU["order"])
-def client_order_clicked(message):
-    text = """اطلاعات زیر رو برامون بفرستید:
+# ------------------ ADMIN PANEL ------------------
 
-اسم:
-حجم مورد نیاز:
+def admin_panel(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📦 سفارشات در انتظار", "✅ سفارشات تکمیل شده")
+    markup.add("🆘 تیکت‌های باز")
+    markup.add("📊 آمار فروش", "👥 تعداد مشتری")
+    markup.add("💰 درآمد کل", "📁 خروجی گرفتن")
+    bot.send_message(message.chat.id, "پنل مدیریت", reply_markup=markup)
 
-(همینجا پیام رو ارسال کن)"""
-    bot.send_message(message.chat.id, text)
+# ------------------ CUSTOMER FLOW ------------------
 
-# -------------------------
-# ارسال متن سفارش به ادمین
-# -------------------------
-@bot.message_handler(func=lambda message: message.chat.id != ADMIN_ID, content_types=['text'])
-def handle_text_customer(message):
-    # اگر مشتری منوی دکمه پشتیبانی/ثبت سفارش رو زده، اینجا دوباره نگیر
-    if message.text in (CLIENT_MENU["order"], CLIENT_MENU["support"]):
+@bot.message_handler(func=lambda m: m.text == "📦 ثبت سفارش")
+def order_menu(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for i in range(1, 11):
+        markup.add(f"{i} گیگ - {prices[i]} تومان")
+    markup.add("🔙 بازگشت")
+
+    user_states[message.chat.id] = "choosing_volume"
+    bot.send_message(message.chat.id, "حجم مورد نظر را انتخاب کنید:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text and "گیگ" in m.text)
+def select_volume(message):
+    if user_states.get(message.chat.id) != "choosing_volume":
         return
 
-    # متن سفارش را به ادمین می‌فرستیم (اگر دکمه ثبت سفارش زده، کاربر احتمالاً همین متن رو می‌فرسته)
-    user = message.from_user
-    info_text = f"""
-📦 سفارش جدید
+    volume = int(message.text.split()[0])
+    price = prices[volume]
 
-👤 نام نمایشی: {user.first_name}
-🔗 یوزرنیم: @{user.username if user.username else "ندارد"}
-🆔 آیدی عددی: {user.id}
+    cursor.execute("""
+    INSERT INTO orders (user_id, volume, price, status, date)
+    VALUES (?, ?, ?, ?, ?)
+    """, (message.chat.id, volume, price, "pending", datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
 
-📝 متن سفارش:
-{message.text}
-    """.strip()
+    user_states[message.chat.id] = "waiting_payment"
 
-    bot.send_message(ADMIN_ID, info_text)
     bot.send_message(
         message.chat.id,
-        "✅ اطلاعات شما ارسال شد. پس از تأیید، اطلاعات پرداخت برای شما ارسال می‌شود."
+        f"✅ سفارش ثبت شد\n\n💰 مبلغ: {price} تومان\n\n"
+        f"شماره کارت جهت پرداخت:\n{CARD_NUMBER}\n\n"
+        "پس از پرداخت، فیش را ارسال کنید.",
+        reply_markup=cancel_menu()
     )
 
-    # برای پنل‌ها وضعیت سفارش رو ثبت می‌کنیم
-    orders_pending[user.id] = True
-
-# -------------------------
-# دکمه پشتیبانی برای مشتری
-# -------------------------
-@bot.message_handler(func=lambda m: m.chat.id != ADMIN_ID and m.text == CLIENT_MENU["support"])
-def support_clicked(message):
-    bot.send_message(
-        message.chat.id,
-        "لطفاً مشکل‌تون رو در قالب یک پیام و یا همراه با تصویر بفرستین تا ادمین با شما در ارتباط باشه."
-    )
-    # این کاربر رو منتظر پشتیبانی می‌ذاریم
-    support_waiting[message.chat.id] = True
-
-# -------------------------
-# دریافت پیام/عکس پشتیبانی از مشتری و ارسال به ادمین
-# -------------------------
-@bot.message_handler(func=lambda m: m.chat.id != ADMIN_ID, content_types=['text'])
-def support_text_handler(message):
-    # اگر کاربر در حالت پشتیبانی است، پیام رو به ادمین فوروارد می‌کنیم
-    if message.chat.id in support_waiting:
-        user = message.from_user
-        text = f"""
-🆘 پیام پشتیبانی از مشتری
-
-👤 نام نمایشی: {user.first_name}
-🔗 یوزرنیم: @{user.username if user.username else "ندارد"}
-🆔 آیدی عددی: {user.id}
-
-📝 متن:
-{message.text}
-        """.strip()
-
-        sent = bot.send_message(ADMIN_ID, text)
-        # این message_id مربوط به ادمینه، با ریپلای می‌تونیم کاربر رو پیدا کنیم
-        support_map[sent.message_id] = message.chat.id
-
-        bot.send_message(
-            message.chat.id,
-            "✅ پیام شما به ادمین ارسال شد. لطفاً منتظر پاسخ باشید."
-        )
-
-@bot.message_handler(func=lambda m: m.chat.id != ADMIN_ID, content_types=['photo'])
-def support_photo_handler(message):
-    if message.chat.id in support_waiting:
-        user = message.from_user
-
-        sent = bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-
-        # با ریپلای روی همین پیام فوروارد شده، به کاربر می‌رسیم
-        support_map[sent.message_id] = message.chat.id
-
-        # مشخصات رو هم کنار فوروارد می‌تونیم بفرستیم (اختیاری)
-        # اگر دوست داری، اینجا یک متن مشخصات هم بفرست
-        bot.send_message(
-            ADMIN_ID,
-            f"👤 مشتری: {user.first_name} | @{user.username if user.username else 'ندارد'} | ID: {user.id}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "✅ تصویر شما به ادمین ارسال شد. لطفاً منتظر پاسخ باشید."
-        )
-
-# -------------------------
-# دریافت فیش پرداخت (از مشتری) و فوروارد به ادمین
-# -------------------------
 @bot.message_handler(content_types=['photo'])
-def receive_payment_photo(message):
-    # فقط اگر پیام از مشتری باشد (نه ادمین) و منتظر پرداخت باشد
-    if message.chat.id == ADMIN_ID:
+def handle_payment(message):
+    if user_states.get(message.chat.id) != "waiting_payment":
         return
 
-    if message.chat.id in waiting_for_payment:
-        sent = bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-        payment_map[sent.message_id] = message.chat.id
+    cursor.execute("SELECT id FROM orders WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                   (message.chat.id,))
+    order = cursor.fetchone()
 
-        bot.send_message(message.chat.id, "✅ فیش دریافت شد. منتظر ارسال فایل محصول باشید.")
-        waiting_for_payment.pop(message.chat.id, None)
+    if order:
+        order_id = order[0]
+        bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        bot.send_message(ADMIN_ID, f"فیش سفارش شماره {order_id}")
 
-# نکته: در کد قبلی شما waiting_for_payment را تنظیم نکرده بودیم
-# پس برای اینکه جریان کامل شود، بعد از ارسال سفارش به ادمین باید پرداخت فعال شود.
-# اما شما گفتی همون کد قبلی خوبه—اینجا برای تکمیل، فرض می‌کنیم ادمین بعد از ریپلای:
-# به مشتری پیام می‌ده و ربات مشتری را در waiting_for_payment قرار می‌دهد.
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID, content_types=['text'])
-def admin_reply_logic(message):
-    # فقط پیام‌هایی که ریپلای هستند
-    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "✅ فیش ارسال شد، منتظر تأیید باشید.")
+        user_states[message.chat.id] = "none"
+
+# ------------------ SUPPORT ------------------
+
+@bot.message_handler(func=lambda m: m.text == "🆘 پشتیبانی")
+def support(message):
+    user_states[message.chat.id] = "support"
+    bot.send_message(message.chat.id, "پیام خود را ارسال کنید:", reply_markup=cancel_menu())
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "support")
+def support_message(message):
+    bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+    bot.send_message(message.chat.id, "✅ پیام شما ارسال شد.")
+
+# ------------------ ADMIN REPLY SYSTEM ------------------
+
+@bot.message_handler(func=lambda m: m.reply_to_message and m.chat.id == ADMIN_ID)
+def admin_reply(message):
+    try:
+        user_id = message.reply_to_message.forward_from.id
+    except:
         return
 
-    # 1) حالت پرداخت: اگر ریپلای روی پیام سفارش کاربر است و متن شامل اطلاعات پرداخت باشد
-    # ما قبلاً در کد قبلی روش استخراج user_id از متن را داشتیم، اینجا همان را نگه می‌داریم
-    replied = message.reply_to_message
-    if not hasattr(replied, "text") or not replied.text:
-        return
-
-    # استخراج user_id از خط "آیدی عددی: ..."
-    lines = replied.text.split("\n")
-    user_id_line = [line for line in lines if "آیدی عددی" in line]
-
-    if user_id_line:
-        try:
-            user_id = int(user_id_line[0].split(":")[1].strip())
-        except:
-            return
-
-        # پیام ادمین به معنی ارسال اطلاعات پرداخت به مشتری است
-        waiting_for_payment[user_id] = True
+    if message.content_type == "text":
         bot.send_message(user_id, message.text)
-        return
+    elif message.content_type == "photo":
+        bot.send_photo(user_id, message.photo[-1].file_id)
 
-    # 2) حالت ارسال فایل بعد از فیش: ادمین روی فیش ریپلای می‌کند و فایل می‌فرستد
-    # این منطق در handler فایل/عکس در ادامه مدیریت می‌شود.
+    cursor.execute("UPDATE orders SET status='completed' WHERE user_id=? AND status='pending'",
+                   (user_id,))
+    conn.commit()
 
-# -------------------------
-# ادمین فایل/عکس را روی فیش ریپلای می‌کند -> ارسال به مشتری
-# -------------------------
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID, content_types=['document', 'photo', 'video', 'audio'])
-def admin_send_product(message):
-    if not message.reply_to_message:
-        return
+# ------------------ STATS ------------------
 
-    replied_message_id = message.reply_to_message.message_id
+@bot.message_handler(func=lambda m: m.text == "📊 آمار فروش")
+def stats(message):
+    cursor.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE status='completed'")
+    data = cursor.fetchone()
+    bot.send_message(message.chat.id,
+                     f"✅ تعداد فروش: {data[0] or 0}\n💰 مجموع درآمد: {data[1] or 0} تومان")
 
-    # آیا این ریپلای مربوط به فیش پرداخت است؟
-    if replied_message_id in payment_map:
-        user_id = payment_map[replied_message_id]
+@bot.message_handler(func=lambda m: m.text == "👥 تعداد مشتری")
+def customers(message):
+    cursor.execute("SELECT COUNT(*) FROM users")
+    count = cursor.fetchone()[0]
+    bot.send_message(message.chat.id, f"👥 تعداد کل مشتریان: {count}")
 
-        if message.content_type == 'document':
-            bot.send_document(user_id, message.document.file_id)
-        elif message.content_type == 'video':
-            bot.send_video(user_id, message.video.file_id)
-        elif message.content_type == 'audio':
-            bot.send_audio(user_id, message.audio.file_id)
-        elif message.content_type == 'photo':
-            bot.send_photo(user_id, message.photo[-1].file_id)
+@bot.message_handler(func=lambda m: m.text == "💰 درآمد کل")
+def total_income(message):
+    cursor.execute("SELECT SUM(price) FROM orders WHERE status='completed'")
+    income = cursor.fetchone()[0]
+    bot.send_message(message.chat.id, f"💰 درآمد کل: {income or 0} تومان")
 
-        bot.send_message(user_id, "✅ فایل خریداری‌شده برای شما ارسال شد.")
-        orders_completed.add(user_id)
-        orders_pending.pop(user_id, None)
+# ------------------ EXPORT ------------------
 
-        return
+@bot.message_handler(func=lambda m: m.text == "📁 خروجی گرفتن")
+def export_data(message):
+    cursor.execute("SELECT * FROM orders")
+    rows = cursor.fetchall()
 
-    # آیا این ریپلای مربوط به پشتیبانی است؟
-    if replied_message_id in support_map:
-        user_id = support_map[replied_message_id]
+    with open("orders.csv", "w", newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["ID", "User ID", "Volume", "Price", "Status", "Date"])
+        writer.writerows(rows)
 
-        # هر نوع فایل/عکس که ادمین بفرسته، به مشتری ارسال میشه
-        if message.content_type == 'document':
-            bot.send_document(user_id, message.document.file_id)
-        elif message.content_type == 'video':
-            bot.send_video(user_id, message.video.file_id)
-        elif message.content_type == 'audio':
-            bot.send_audio(user_id, message.audio.file_id)
-        elif message.content_type == 'photo':
-            bot.send_photo(user_id, message.photo[-1].file_id)
+    with open("orders.csv", "rb") as f:
+        bot.send_document(message.chat.id, f)
 
-        bot.send_message(user_id, "✅ پاسخ/فایل شما برای مشتری ارسال شد.")
-        # اگر خواستی بعد از ارسال فایل، پشتیبانی رو ببندیم:
-        # support_waiting.pop(user_id, None)
-        return
-
-# -------------------------
-# منوی پنل ادمین
-# -------------------------
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID, content_types=['text'])
-def admin_menu(message):
-    if message.text == ADMIN_MENU["support"]:
-        if not support_waiting:
-            bot.send_message(ADMIN_ID, "✅ فعلاً کسی نیاز به پشتیبانی نداره.")
-            return
-
-        # ارسال لیست ساده user_id ها
-        ids = list(support_waiting.keys())
-        bot.send_message(ADMIN_ID, "👥 مشتری‌های نیازمند پشتیبانی:\n" + "\n".join(map(str, ids)))
-        return
-
-    if message.text == ADMIN_MENU["pending"]:
-        if not orders_pending:
-            bot.send_message(ADMIN_ID, "✅ سفارش در حال انتظار نداریم.")
-            return
-        ids = list(orders_pending.keys())
-        bot.send_message(ADMIN_ID, "📌 سفارش‌های کامل‌نشده (user_id):\n" + "\n".join(map(str, ids)))
-        return
-
-    if message.text == ADMIN_MENU["completed"]:
-        if not orders_completed:
-            bot.send_message(ADMIN_ID, "✅ هنوز سفارشی کامل نشده.")
-            return
-        ids = list(orders_completed)
-        bot.send_message(ADMIN_ID, "✅ سفارش‌های کامل‌شده (user_id):\n" + "\n".join(map(str, ids)))
-        return
+# ------------------
 
 bot.infinity_polling()
-        
+    
